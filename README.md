@@ -69,16 +69,39 @@ RAG_JUDGE=1 RAG_LIMIT=3 node --env-file=.env src/eval_rag.js
 
 Necesita `OPENAI_API_KEY` y la `SUPABASE_SERVICE_ROLE_KEY` **del proyecto del bot** — la función de recuperación está concedida solo a `service_role`, así que una clave publishable no sirve. Ajustables por entorno: `SUPABASE_URL`, `RAG_TENANT_ID`, `RAG_BRAND_ID`, `RAG_MODE`, `RAG_JUDGE_MODEL`, `RAG_ANSWER_MODEL`.
 
-| Modo | Recall@8 | MRR | Score prom. preguntas fuera de tema |
-|---|---|---|---|
-| Vector puro (baseline, KB de resúmenes) | 33.3% (11/33) | 0.259 | 0.208 |
-| Hybrid + rewriting + rerank | 36.4% (12/33) | 0.269 | 0.208 |
-| Hybrid + chunks de transcript (Fase 3, ~27K filas) | 36.4% (12/33) | 0.289 | 0.217 |
-| **Función de producción actual (Fase 5)** | **57.6% (19/33)** | **0.425** | 0.274 |
+| Modo | Fecha | Recall@8 | MRR | Score prom. fuera de tema |
+|---|---|---|---|---|
+| Vector puro (baseline, KB de resúmenes) | 07-10 | 33.3% (11/33) | 0.259 | 0.208 |
+| Hybrid + rewriting + rerank | 07-10 | 36.4% (12/33) | 0.269 | 0.208 |
+| Hybrid + chunks de transcript (Fase 3, ~27K filas) | 07-12 | 36.4% (12/33) | 0.289 | 0.217 |
+| Función de producción, proyecto compartido (ivfflat) | 08-04 | 57.6% (19/33) | 0.425 | 0.274 |
+| **Producción actual, proyecto propio (HNSW)** | 08-29 | **78.1% (25/32)** | **0.593** | 0.339 |
 
-Las tres primeras filas se midieron contra `match_kb_documents_hybrid`; la última contra `match_kb_published_documents_hybrid_v1`, la que sirve al bot hoy. Cambió la función **y** el estado de la KB, así que el salto 36.4% → 57.6% es el efecto acumulado de tres cambios (chunking por timestamp, migración a la función v1, limpieza de contaminación publicitaria), no de uno solo. El MRR es la señal más fuerte: **12 de los 19 aciertos salen en el puesto 1**, o sea que cuando el sistema encuentra el episodio correcto ahora lo rankea primero.
+**Sobre el salto de la última fila, con la advertencia por delante:** el denominador cambió de 33 a 32 porque se corrigió que una pregunta sin ground truth contaba como fallo, así que la comparación honesta es 59.4% → 78.1%. Y no es mérito de ningún cambio de recuperación: entre ambas mediciones el corpus se migró a un proyecto Supabase propio y el índice vectorial pasó de **ivfflat (`lists=170`) a HNSW**. ivfflat es aproximado y con ese número de listas sobre 27K filas se deja candidatos afuera; HNSW recupera muchos más. Es la explicación más probable, pero **no está verificada**: el estado anterior ya no existe, así que no pude re-medirlo. Se reporta como hipótesis fundada, no como conclusión.
 
-Las 5 preguntas vagas fallan las 5 en esta medición, pero el harness evalúa **recuperación pura**, sin el query rewriting que sí corre en producción — así que 57.6% es un piso, no el rendimiento del bot completo.
+El MRR sí es señal limpia: **16 de los 25 aciertos salen en el puesto 1**. Cuando el sistema encuentra el episodio correcto, lo rankea primero.
+
+El harness evalúa **recuperación pura**, sin el query rewriting que sí corre en producción, así que 78.1% es un piso, no el rendimiento del bot completo.
+
+### Resultados de las métricas de juez (2026-08-29, 42 preguntas)
+
+| Tipo | Relevancia del contexto | Groundedness |
+|---|---|---|
+| Específicas (28) | 72.0% | **95.0%** |
+| Vagas (5) | 83.3% | **77.6%** |
+| Genéricas (6) | 80.6% | **86.3%** |
+| Fuera de tema (3) | 11.1% | n/a |
+| **Global** | **74.8%** | **91.4%** |
+
+Tres lecturas que Recall@8 no podía dar:
+
+**1. Cuanto más vaga la pregunta, más inventa el modelo.** Groundedness cae de 95% en preguntas específicas a 77.6% en vagas. El peor caso, *"consejos para tener más energía"*, apoyó **7 de 15** afirmaciones — el modelo rellenó casi la mitad desde su conocimiento pretrained. Es el mismo mecanismo del incidente de la publicidad (caso de estudio 5), ahora cuantificado en vez de descubierto por casualidad.
+
+**2. Un acierto de recall puede tener el contexto lleno de ruido.** *"¿Cuáles son los tres pilares de un sueño saludable?"* recuperó el episodio esperado en el puesto 3 — Recall@8 lo cuenta como éxito — pero solo **1 de 6** fragmentos servía. La métrica de posición no ve la calidad de lo que llena los otros cinco puestos.
+
+**3. Un fallo de recall puede ser una respuesta correcta.** *"¿Cuándo hay que exponerse a la luz solar de la mañana?"* cuenta como MISS y sin embargo trajo **6/6 fragmentos relevantes** y respondió con **8/8 afirmaciones respaldadas**. El episodio "esperado" no salió, pero otros responden igual de bien. Eso no es un fallo del sistema: es un límite del ground truth de un episodio único por pregunta.
+
+El control fuera de tema se comporta como debe: 11.1% de relevancia, o sea que para "cuál es la capital de Francia" el sistema no encuentra casi nada — y no lo disfraza.
 
 ### Las dos métricas que Recall@8 no puede dar
 
@@ -189,7 +212,8 @@ El desenlace más útil está en la sección de evaluación: **medido, el efecto
 
 ## Limitaciones conocidas / roadmap
 
-- **Las métricas de juez están implementadas y validadas, pero sin línea base publicada.** Correrlas contra las 42 preguntas requiere la clave `service_role` del proyecto Supabase del bot; la tabla de arriba sigue siendo solo de recuperación hasta esa corrida.
+- **El salto de recall 08-04 → 08-29 no está atribuido con certeza.** La hipótesis (ivfflat → HNSW) es fundada pero no se pudo verificar: el estado anterior ya no existe. Un A/B limpio requeriría reconstruir ambos índices sobre el mismo corpus y re-medir.
+- **Groundedness de 77.6% en preguntas vagas** es el número más accionable del harness: una de cada cuatro afirmaciones no se apoya en el contexto. Candidatos a probar: pedir abstención explícita cuando la relevancia del contexto es baja, o subir el umbral de confianza antes de componer.
 - **El juez LLM no está calibrado contra criterio humano.** Se validó que discrimina en casos extremos (publicidad vs. contenido útil), no que coincida con un anotador humano en casos ambiguos. Para eso haría falta un subconjunto etiquetado a mano y medir acuerdo.
 - **34/413 episodios fuera del índice de transcript** (formato de caption por línea distinto al de marcadores de capítulo) — pendiente extender el parser.
 - **Cross-encoder reranker** dedicado en vez de LLM-rerank genérico, y benchmark más amplio que las 42 preguntas doradas.
