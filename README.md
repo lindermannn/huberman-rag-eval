@@ -2,7 +2,7 @@
 
 Bot de coaching conversacional (Telegram) basado en el contenido del podcast [Huberman Lab](https://www.hubermanlab.com/), construido como pieza de portafolio para demostrar diseño e implementación de un sistema RAG (Retrieval-Augmented Generation) de nivel producción: ingesta, recuperación híbrida, reranking, evaluación cuantitativa y debugging real en producción.
 
-No es un wrapper de un LLM con un prompt largo. Es un pipeline de recuperación con evaluación medible, iterado en base a datos, corriendo sobre infraestructura multi-tenant compartida (n8n Cloud + Supabase/pgvector).
+No es un wrapper de un LLM con un prompt largo. Es un pipeline de recuperación con evaluación medible, iterado en base a datos. Nació sobre infraestructura multi-tenant compartida y hoy corre aislado: workflow propio en n8n Cloud y **proyecto Supabase propio** desde 2026-08-13 (ver Caso de estudio 4).
 
 ## Arquitectura
 
@@ -25,7 +25,7 @@ Script: [`src/migrate_to_supabase.js`](src/migrate_to_supabase.js). Corre 100% l
 mensaje del usuario
   → Query Rewriting (LLM reescribe preguntas vagas/coloquiales a keywords de búsqueda concretas)
   → embedding de la query reescrita
-  → Hybrid Search en Supabase (match_kb_documents_hybrid):
+  → Hybrid Search en Supabase (match_kb_published_documents_hybrid_v1):
         similitud vectorial (coseno, pgvector)  ⊕  full-text search Postgres (BM25-like, content_tsv/websearch_to_tsquery)
         fusionados con Reciprocal Rank Fusion (RRF, k=50)
   → LLM Rerank (reordena los top-K candidatos por relevancia real a la pregunta)
@@ -47,7 +47,27 @@ Búsqueda vectorial pura falla en dos casos comunes en este dominio: (a) pregunt
 
 ## Evaluación
 
-Metodología: set de 36 "preguntas doradas" ([`data/golden_questions.json`](data/golden_questions.json)) con ground truth (número de episodio esperado) **sacado directamente de la KB real**, nunca inventado — 28 preguntas específicas, 5 vagas, 3 de control fuera de tema (para verificar degradación honesta, no alucinación). Harness de evaluación 100% local: [`src/eval_rag.js`](src/eval_rag.js), mide Recall@8 y MRR (Mean Reciprocal Rank).
+Metodología: set de 42 "preguntas doradas" ([`data/golden_questions.json`](data/golden_questions.json)) con ground truth (número de episodio esperado) **sacado directamente de la KB real**, nunca inventado — 28 específicas, 5 vagas, 3 de control fuera de tema (para verificar degradación honesta, no alucinación) y 6 genéricas. Harness de evaluación 100% local: [`src/eval_rag.js`](src/eval_rag.js).
+
+Mide dos familias de métricas complementarias:
+
+- **Posición en el ranking** — Recall@8 y MRR. Baratas (un embedding por pregunta), corren por defecto.
+- **Utilidad de lo recuperado** — relevancia del contexto y groundedness, vía juez LLM. Se activan con `RAG_JUDGE=1` porque cuestan tres llamadas extra por pregunta.
+
+Las 6 preguntas genéricas ("suplementos para entrenar fuerza", "qué tomar para dormir") están **tomadas de logs reales de producción**, no inventadas, y no llevan episodio esperado: a una consulta amplia le sirven muchos episodios distintos, así que exigir uno concreto mediría ruido. Se evalúan solo por relevancia del contexto — que es precisamente donde la contaminación publicitaria se manifiesta.
+
+```bash
+# Solo recuperación (Recall@8 + MRR) — un embedding por pregunta
+node --env-file=.env src/eval_rag.js
+
+# Con las métricas de juez LLM
+RAG_JUDGE=1 node --env-file=.env src/eval_rag.js
+
+# Prueba de humo antes de gastar en las 42
+RAG_JUDGE=1 RAG_LIMIT=3 node --env-file=.env src/eval_rag.js
+```
+
+Necesita `OPENAI_API_KEY` y la `SUPABASE_SERVICE_ROLE_KEY` **del proyecto del bot** — la función de recuperación está concedida solo a `service_role`, así que una clave publishable no sirve. Ajustables por entorno: `SUPABASE_URL`, `RAG_TENANT_ID`, `RAG_BRAND_ID`, `RAG_MODE`, `RAG_JUDGE_MODEL`, `RAG_ANSWER_MODEL`.
 
 | Modo | Recall@8 | MRR | Score prom. preguntas fuera de tema |
 |---|---|---|---|
@@ -59,6 +79,19 @@ Metodología: set de 36 "preguntas doradas" ([`data/golden_questions.json`](data
 Las tres primeras filas se midieron contra `match_kb_documents_hybrid`; la última contra `match_kb_published_documents_hybrid_v1`, la que sirve al bot hoy. Cambió la función **y** el estado de la KB, así que el salto 36.4% → 57.6% es el efecto acumulado de tres cambios (chunking por timestamp, migración a la función v1, limpieza de contaminación publicitaria), no de uno solo. El MRR es la señal más fuerte: **12 de los 19 aciertos salen en el puesto 1**, o sea que cuando el sistema encuentra el episodio correcto ahora lo rankea primero.
 
 Las 5 preguntas vagas fallan las 5 en esta medición, pero el harness evalúa **recuperación pura**, sin el query rewriting que sí corre en producción — así que 57.6% es un piso, no el rendimiento del bot completo.
+
+### Las dos métricas que Recall@8 no puede dar
+
+Recall@8 responde *"¿está el episodio esperado entre los 8 primeros?"*. No responde *"¿sirve de algo lo que trajo?"* ni *"¿la respuesta sale de ahí o el modelo la inventó?"*. Las dos métricas nuevas cubren cada hueco:
+
+| Métrica | Pregunta que responde | Cómo se calcula |
+|---|---|---|
+| **Relevancia del contexto** | De los 6 fragmentos que llegan al modelo, ¿cuántos aportan algo? | Un juez LLM marca cada fragmento como útil o ruido (publicidad, patrocinios, intros, pedidos de suscripción) |
+| **Groundedness** | De las afirmaciones de la respuesta, ¿cuántas se apoyan en el contexto? | Se genera una respuesta con el prompt de producción y un juez cuenta afirmaciones respaldadas sobre afirmaciones totales |
+
+Ambas se validaron con casos controlados antes de usarlas: contexto 100% publicitario → relevancia 0/2; contexto mixto → 1/2; respuesta con cifras inventadas ("20 g de creatina, aumento de fuerza del 47%") → groundedness 0/4; respuesta fiel al contexto → 3/3. Sin esa validación previa, un juez LLM es solo otra fuente de números sin verificar.
+
+El episodio que motivó ambas: una consulta real devolvió **6 de 6 fragmentos publicitarios** y el modelo respondió de su conocimiento pretrained adjuntando 6 citas que no respaldaban nada. Relevancia del contexto 0%, groundedness ~0% — y Recall@8 sin registrar absolutamente nada.
 
 Sobre las tres primeras filas: mejora real pero modesta, reportada sin inflar. El score de las preguntas de control se mantuvo estable y bajo, confirmando que el sistema no empezó a alucinar para preguntas fuera de dominio al subir el recall. La Fase 3 no movió el Recall@8 (los chunks finos no agregan episodios nuevos al top-8) pero sí el MRR: cuando el sistema encuentra el episodio correcto lo rankea mejor, porque existe una unidad de contenido específica en vez de solo el resumen del episodio completo. Ejemplo real: "¿qué es la L-teanina?" pasó de "no encontré información" (gap de granularidad documentado abajo) a una cita precisa con timestamp.
 
@@ -128,6 +161,10 @@ La limitación de citas fabricadas (Fase 4, arriba) tenía un diseño de arreglo
 
 **Decisión:** en vez de aumentar la sofisticación de la arquitectura compartida, reducir el acoplamiento del bot con ella. Extracción completa a un workflow único y autocontenido: mismo trigger de Telegram, misma capa de dedup, pero el pipeline de recuperación y composición corre inline, sin pasar por el router ni el motor de agente compartidos. El cambio de diseño más importante: **el retrieval dejó de ser una decisión de un agente con tool-calling y pasó a ser un paso incondicional del pipeline.** Sin una herramienta que un LLM pueda decidir no invocar, la clase de bug completa (citas fabricadas cuando el agente saltea el RAG) deja de ser posible — no hace falta ningún mecanismo de correlación cross-ejecución para blindarla.
 
+**La extracción se completó el 2026-08-13 con la migración a un proyecto Supabase propio.** Hasta entonces el bot ya no dependía del router ni del motor de agente compartidos, pero seguía leyendo del mismo Postgres que la plataforma multi-tenant — un acoplamiento de datos que la separación de workflows no resolvía. Con las 27.254 filas en su propio proyecto, el bot es portable de verdad: el corpus, la función de recuperación y el workflow se mueven juntos.
+
+Ese cambio dejó una lección de mantenimiento: el harness de evaluación tenía el proyecto **hardcodeado** y quedó apuntando al viejo durante dos semanas, fallando con un error de autorización engañoso. Hoy el proyecto, el tenant y la marca se leen de variables de entorno, con el proyecto correcto por defecto — un valor hardcodeado en una herramienta de medición se convierte en deuda en cuanto la infraestructura se mueve.
+
 Además, ya con cero dependencias de la plataforma compartida, se sumaron mejoras de producto que antes hubieran significado tocar infraestructura común: memoria de conversación propia con expiración (6h de inactividad reinicia el contexto), detección de saludos/chit-chat para no gastar una llamada de RAG completa en un "Hola", y las citas con deep-link vuelven a ofrecerse bajo demanda — pero ahora con un *fast path* que responde con los links de la última respuesta sin volver a correr el pipeline completo.
 
 **Dos bugs reales de la migración, detectados en producción antes/después de publicar (no en desarrollo):**
@@ -152,10 +189,10 @@ El desenlace más útil está en la sección de evaluación: **medido, el efecto
 
 ## Limitaciones conocidas / roadmap
 
-- **Faltan métricas de relevancia del contexto y groundedness.** El harness mide posición en el ranking (Recall@8, MRR), no utilidad de lo recuperado ni fundamentación de la respuesta. El caso de la publicidad lo demostró empíricamente: contaminación del 100% en un caso real, invisible para las métricas actuales. Próxima extensión del evaluador.
-- **El golden set no cubre consultas genéricas** del tipo que hacen los usuarios reales ("suplementos para entrenar fuerza", "qué tomar para dormir") — justo el patrón donde la contaminación se manifiesta.
+- **Las métricas de juez están implementadas y validadas, pero sin línea base publicada.** Correrlas contra las 42 preguntas requiere la clave `service_role` del proyecto Supabase del bot; la tabla de arriba sigue siendo solo de recuperación hasta esa corrida.
+- **El juez LLM no está calibrado contra criterio humano.** Se validó que discrimina en casos extremos (publicidad vs. contenido útil), no que coincida con un anotador humano en casos ambiguos. Para eso haría falta un subconjunto etiquetado a mano y medir acuerdo.
 - **34/413 episodios fuera del índice de transcript** (formato de caption por línea distinto al de marcadores de capítulo) — pendiente extender el parser.
-- **Cross-encoder reranker** dedicado en vez de LLM-rerank genérico, y benchmark más amplio que las 36 preguntas doradas.
+- **Cross-encoder reranker** dedicado en vez de LLM-rerank genérico, y benchmark más amplio que las 42 preguntas doradas.
 - **Slot allocation por tipo de chunk** (resumen de episodio vs. segmento de transcript con timestamp): hoy compiten sin distinción por los mismos puestos del top-K; garantizar representación mínima de cada tipo podría mejorar la especificidad de las respuestas — identificado, no implementado.
 
 ## Stack
