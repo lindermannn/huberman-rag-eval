@@ -1,8 +1,18 @@
-# Bot de Huberman — Sistema RAG
+# Huberman RAG — retrieval with a measured evaluation harness
 
-Bot de coaching conversacional (Telegram) basado en el contenido del podcast [Huberman Lab](https://www.hubermanlab.com/), construido como pieza de portafolio para demostrar diseño e implementación de un sistema RAG (Retrieval-Augmented Generation) de nivel producción: ingesta, recuperación híbrida, reranking, evaluación cuantitativa y debugging real en producción.
+Production Telegram bot over **27,254 chunks** from ~417 [Huberman Lab](https://www.hubermanlab.com/) episodes. Hybrid retrieval (pgvector + Postgres full-text, fused with RRF) → query rewriting → LLM rerank, running as a self-contained n8n workflow against a dedicated Supabase project.
 
-No es un wrapper de un LLM con un prompt largo. Es un pipeline de recuperación con evaluación medible, iterado en base a datos. Nació sobre infraestructura multi-tenant compartida y hoy corre aislado: workflow propio en n8n Cloud y **proyecto Supabase propio** desde 2026-08-13 (ver Caso de estudio 4).
+**Measured, not claimed** — 42 golden questions run against the production retrieval function:
+
+| Recall@8 | MRR | Context relevance | Groundedness | Judge noise floor |
+|---|---|---|---|---|
+| 78.1% | 0.593 | 83.8% | 93.2% | ~9 pts |
+
+**The evaluation harness is the point of this repo — and it was wrong first.** An earlier baseline reported that vague questions caused more hallucination. That finding was **retracted** once the judge turned out to be truncating its own input, penalising exactly the long answers vague questions produce. → [Case study: tuning the instrument before trusting it](#afinar-el-instrumento-antes-de-confiar-en-él-2026-08-30)
+
+Not an LLM wrapper with a long prompt: a retrieval pipeline iterated against data. Five production case studies below, including a silent hybrid-search regression found by reading live infrastructure, and an ad-contamination failure that recall metrics structurally cannot see.
+
+> Architecture and case studies below are written in Spanish.
 
 ## Arquitectura
 
