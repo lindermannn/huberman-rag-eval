@@ -65,9 +65,15 @@ RAG_JUDGE=1 node --env-file=.env src/eval_rag.js
 
 # Prueba de humo antes de gastar en las 42
 RAG_JUDGE=1 RAG_LIMIT=3 node --env-file=.env src/eval_rag.js
+
+# Ruido del propio juez: juzga 3 veces las mismas entradas.
+# La muestra debe cubrir los cuatro tipos de pregunta, no solo las primeras del set.
+RAG_JUDGE=1 RAG_JUDGE_REPEAT=3 RAG_IDS=gq04,gq14,gq22,gq29,gq33,gq37,gq40,gq35   node --env-file=.env src/eval_rag.js
 ```
 
-Necesita `OPENAI_API_KEY` y la `SUPABASE_SERVICE_ROLE_KEY` **del proyecto del bot** — la función de recuperación está concedida solo a `service_role`, así que una clave publishable no sirve. Ajustables por entorno: `SUPABASE_URL`, `RAG_TENANT_ID`, `RAG_BRAND_ID`, `RAG_MODE`, `RAG_JUDGE_MODEL`, `RAG_ANSWER_MODEL`.
+Necesita `OPENAI_API_KEY` y la `SUPABASE_SERVICE_ROLE_KEY` **del proyecto del bot** — la función de recuperación está concedida solo a `service_role`, así que una clave publishable no sirve. Ajustables por entorno: `SUPABASE_URL`, `RAG_TENANT_ID`, `RAG_BRAND_ID`, `RAG_MODE`, `RAG_JUDGE_MODEL`, `RAG_ANSWER_MODEL`, `RAG_JUDGE_REPEAT`, `RAG_LIMIT`, `RAG_IDS`.
+
+Cada corrida imprime su consumo de tokens. La evaluación completa de las 42 con juez de razonamiento y contexto sin truncar gasta **~180K tokens de entrada y ~52K de salida en el juez** (de los cuales 50K son de razonamiento invisible en la respuesta), más ~95K en el generador. El modo `RAG_JUDGE_REPEAT` multiplica la parte del juez, por eso conviene acotarlo con `RAG_IDS`.
 
 | Modo | Fecha | Recall@8 | MRR | Score prom. fuera de tema |
 |---|---|---|---|---|
@@ -83,25 +89,71 @@ El MRR sí es señal limpia: **16 de los 25 aciertos salen en el puesto 1**. Cua
 
 El harness evalúa **recuperación pura**, sin el query rewriting que sí corre en producción, así que 78.1% es un piso, no el rendimiento del bot completo.
 
-### Resultados de las métricas de juez (2026-08-29, 42 preguntas)
+### Resultados de las métricas de juez (2026-08-30, 42 preguntas)
+
+Juez `gpt-5.6-luna` con contexto completo. Entre paréntesis, lo que medía el instrumento anterior (`gpt-4.1-mini` con contexto truncado) — mismo sistema, mismo día de datos, solo cambió el instrumento:
 
 | Tipo | Relevancia del contexto | Groundedness |
 |---|---|---|
-| Específicas (28) | 72.0% | **95.0%** |
-| Vagas (5) | 83.3% | **77.6%** |
-| Genéricas (6) | 80.6% | **86.3%** |
-| Fuera de tema (3) | 11.1% | n/a |
-| **Global** | **74.8%** | **91.4%** |
+| Específicas (28) | 81.5% (72.0%) | **95.0%** (95.0%) |
+| Vagas (5) | 90.0% (83.3%) | **90.6%** (77.6%) |
+| Genéricas (6) | 88.9% (80.6%) | **87.3%** (86.3%) |
+| Fuera de tema (3) | 16.7% (11.1%) | n/a |
+| **Global** | **83.8%** (74.8%) | **93.2%** (91.4%) |
 
-Tres lecturas que Recall@8 no podía dar:
+Recall@8 y MRR quedaron **idénticos** entre ambas corridas (78.1% / 0.593). Sirven de control: la recuperación no se tocó, así que todo el movimiento de arriba es del instrumento, no del sistema.
 
-**1. Cuanto más vaga la pregunta, más inventa el modelo.** Groundedness cae de 95% en preguntas específicas a 77.6% en vagas. El peor caso, *"consejos para tener más energía"*, apoyó **7 de 15** afirmaciones — el modelo rellenó casi la mitad desde su conocimiento pretrained. Es el mismo mecanismo del incidente de la publicidad (caso de estudio 5), ahora cuantificado en vez de descubierto por casualidad.
+Con el piso de ruido de ~9 puntos, solo dos diferencias son señal: relevancia en específicas (+9.5) y groundedness en vagas (+13.0). El resto entra dentro del error del propio juez y no se puede interpretar.
 
-**2. Un acierto de recall puede tener el contexto lleno de ruido.** *"¿Cuáles son los tres pilares de un sueño saludable?"* recuperó el episodio esperado en el puesto 3 — Recall@8 lo cuenta como éxito — pero solo **1 de 6** fragmentos servía. La métrica de posición no ve la calidad de lo que llena los otros cinco puestos.
+> [!warning] Corrección de una conclusión anterior
+> La primera línea base reportó que **"cuanto más vaga la pregunta, más inventa el modelo"**, con groundedness cayendo de 95% a 77.6%. Medido sin truncar el contexto, ese número real es **90.6%**. La caída respecto de las específicas es de 4.4 puntos — **por debajo del piso de ruido**, así que ya no sostiene la afirmación.
+>
+> La explicación encaja con la causa: las preguntas vagas producen respuestas largas que se apoyan en partes profundas de los fragmentos, justo lo que el corte a 900 caracteres eliminaba del contexto que veía el juez. El instrumento marcaba como inventado lo que sí estaba respaldado, y lo hacía **selectivamente en el tipo de pregunta que genera respuestas más largas** — un sesgo, no ruido aleatorio.
+>
+> El hallazgo que quedó en pie es el otro: el incidente de la publicidad (caso de estudio 5) fue real y verificado a mano contra ejecuciones de producción. Lo que no se sostiene es la generalización de que las preguntas vagas alucinan más.
 
-**3. Un fallo de recall puede ser una respuesta correcta.** *"¿Cuándo hay que exponerse a la luz solar de la mañana?"* cuenta como MISS y sin embargo trajo **6/6 fragmentos relevantes** y respondió con **8/8 afirmaciones respaldadas**. El episodio "esperado" no salió, pero otros responden igual de bien. Eso no es un fallo del sistema: es un límite del ground truth de un episodio único por pregunta.
+Dos lecturas que Recall@8 no podía dar y que sí sobreviven:
+
+**1. Un acierto de recall puede tener el contexto lleno de ruido.** *"¿Cuáles son los tres pilares de un sueño saludable?"* recuperó el episodio esperado en el puesto 3 — Recall@8 lo cuenta como éxito — pero solo **1 de 6** fragmentos servía. La métrica de posición no ve la calidad de lo que llena los otros cinco puestos.
+
+**2. Un fallo de recall puede ser una respuesta correcta.** *"¿Cuándo hay que exponerse a la luz solar de la mañana?"* cuenta como MISS y sin embargo trajo **6/6 fragmentos relevantes** y respondió con **8/8 afirmaciones respaldadas**. El episodio "esperado" no salió, pero otros responden igual de bien. Eso no es un fallo del sistema: es un límite del ground truth de un episodio único por pregunta.
 
 El control fuera de tema se comporta como debe: 11.1% de relevancia, o sea que para "cuál es la capital de Francia" el sistema no encuentra casi nada — y no lo disfraza.
+
+### Afinar el instrumento antes de confiar en él (2026-08-30)
+
+La primera línea base salió con un juez que tenía tres defectos de método. Ninguno se ve en los números: se ven leyendo el código del evaluador.
+
+**1. El juez leía una entrada distinta de la que ve el sistema.** Los fragmentos se truncaban a 700 caracteres para relevancia y 900 para groundedness. Un fragmento cuyo contenido útil empezaba en el carácter 800 se juzgaba como ruido, y una afirmación que el generador sacó del final de un fragmento largo se contaba como inventada. Eran **falsos positivos de alucinación fabricados por el propio instrumento**. Ahora el juez recibe el contexto completo, el mismo que el generador.
+
+**2. El juez era de la misma familia que el generador** — `gpt-4.1-mini` corrigiendo a `gpt-4.1`. Un modelo que evalúa texto de su propia familia tiende a premiarlo. Ahora juzga `gpt-5.6-luna`, que además razona antes de responder, que es justo lo que pide contar afirmaciones respaldadas.
+
+> **Límite honesto:** sigue siendo OpenAI. Cambia el modelo y el modo de inferencia, no el proveedor, así que reduce el sesgo intra-familia pero no lo elimina. Un juez de otro proveedor sería mejor; `RAG_JUDGE_MODEL` queda configurable para cuando haya credenciales de otro.
+
+Cambiar a un modelo de razonamiento obligó a corregir el manejo de parámetros: los `gpt-5*` rechazan `max_tokens` con un 400 y **solo aceptan `temperature=1`**. Es exactamente el fallo que tumbó el motor del SaaS durante una semana en agosto, así que `chat()` ahora ramifica por familia y detecta el caso en que el modelo agota su presupuesto razonando sin llegar a emitir respuesta.
+
+**3. No se conocía el ruido del propio juez.** Sin eso, comparar dos corridas es leer un termómetro sin saber su precisión. `RAG_JUDGE_REPEAT=N` juzga N veces **las mismas entradas** — la respuesta se genera una sola vez y se juzga N veces, para no mezclar la varianza del generador con la del juez. Con `gpt-5.6-luna` esto dejó de ser opcional: al no aceptar `temperature=0`, el juez es estocástico por construcción.
+
+#### Resultado: el ruido no está donde uno lo buscaría
+
+Muestra de 8 preguntas cubriendo los cuatro tipos, 3 repeticiones cada una:
+
+| | Valor |
+|---|---|
+| Fragmentos con veredicto unánime en las 3 corridas | **91.7%** |
+| Relevancia — desviación media / rango medio | 3.7 pts / 8.3 pts |
+| Groundedness — desviación media / rango medio | 4.3 pts / 9.5 pts |
+| **Piso de ruido** | **~9 puntos** |
+
+**Una diferencia menor a ~9 puntos entre dos corridas no es señal.** La primera línea base no traía esa cifra, así que cualquier comparación contra ella habría sido interpretación de ruido.
+
+Dos cosas que solo se ven en el detalle por pregunta:
+
+**El ruido se concentra en los casos límite.** Cinco de las ocho preguntas dieron resultados idénticos en las tres corridas. Casi todo el ruido sale de dos: una con groundedness `43/63/63` (rango de 20 puntos) y otra con relevancia `50/33/67` (rango de 34). Ambas son preguntas cuyo contexto recuperado es pobre o ambiguo — o sea que **el juez es estable cuando el caso es claro e inestable justo donde hay que decidir**. Un único piso de ruido global subestima el error en los casos difíciles.
+
+**Medir el ruido solo sobre preguntas específicas lo subestima a la mitad.** La primera medición usó las 3 primeras del set, todas específicas: dio 100% de unanimidad y un piso de ~5 puntos. Al muestrear los cuatro tipos, la unanimidad bajó a 91.7% y el piso subió a ~9. La muestra con la que se calibra un instrumento tiene que parecerse a aquello sobre lo que se va a usar.
+
+**Lo más inestable es el denominador, no el ratio.** Juzgando la misma respuesta, el juez contó entre 15 y 26 afirmaciones factuales. Cuántas afirmaciones contiene un texto es un juicio con latitud legítima; qué fracción está respaldada resulta bastante más estable que sus dos componentes por separado.
 
 ### Las dos métricas que Recall@8 no puede dar
 
@@ -213,7 +265,9 @@ El desenlace más útil está en la sección de evaluación: **medido, el efecto
 ## Limitaciones conocidas / roadmap
 
 - **El salto de recall 08-04 → 08-29 no está atribuido con certeza.** La hipótesis (ivfflat → HNSW) es fundada pero no se pudo verificar: el estado anterior ya no existe. Un A/B limpio requeriría reconstruir ambos índices sobre el mismo corpus y re-medir.
-- **Groundedness de 77.6% en preguntas vagas** es el número más accionable del harness: una de cada cuatro afirmaciones no se apoya en el contexto. Candidatos a probar: pedir abstención explícita cuando la relevancia del contexto es baja, o subir el umbral de confianza antes de componer.
+- **El juez sigue siendo del mismo proveedor que el generador.** `gpt-5.6-luna` reduce el sesgo intra-familia respecto de `gpt-4.1-mini`, no lo elimina. Un juez de otro proveedor es la mejora pendiente más clara; `RAG_JUDGE_MODEL` ya es configurable.
+- **El piso de ruido se midió sobre 8 preguntas y 3 repeticiones.** Suficiente para saber que ~9 puntos no son señal, escaso para caracterizar la cola. Más repeticiones darían un intervalo en vez de un rango.
+- **El ruido del juez no es uniforme y se reporta como si lo fuera.** Se concentra en preguntas de contexto ambiguo, donde llega a 20-34 puntos de rango. Un piso por tipo de pregunta —o condicionado a la relevancia del contexto— sería más honesto que un único número global.
 - **El juez LLM no está calibrado contra criterio humano.** Se validó que discrimina en casos extremos (publicidad vs. contenido útil), no que coincida con un anotador humano en casos ambiguos. Para eso haría falta un subconjunto etiquetado a mano y medir acuerdo.
 - **34/413 episodios fuera del índice de transcript** (formato de caption por línea distinto al de marcadores de capítulo) — pendiente extender el parser.
 - **Cross-encoder reranker** dedicado en vez de LLM-rerank genérico, y benchmark más amplio que las 42 preguntas doradas.
