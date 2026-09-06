@@ -22,6 +22,13 @@
 const fs = require('fs');
 const path = require('path');
 
+const {
+  aggregate,
+  esFamiliaRazonamiento,
+  evalOne,
+  parseJson,
+  resumirSerie
+} = require('./metrics');
 const OPENAI_KEY = process.env.OPENAI_API_KEY;
 // Acepta los nombres que se usaron historicamente en este repo.
 const SUPABASE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY
@@ -63,6 +70,7 @@ const ANSWER_CHUNKS = 6;
 
 if (!OPENAI_KEY) { console.error('Falta OPENAI_API_KEY.'); process.exit(1); }
 if (!SUPABASE_KEY) { console.error('Falta SUPABASE_SERVICE_ROLE_KEY.'); process.exit(1); }
+if (!SUPABASE_URL) { console.error('Falta SUPABASE_URL. Define la URL del proyecto Supabase en el entorno.'); process.exit(1); }
 
 const golden = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'data', 'golden_questions.json'), 'utf8'));
 
@@ -113,9 +121,6 @@ async function queryKb(embedding, queryText) {
 // aceptan temperature=1 (o sea: hay que omitirla). Mandar los parametros de la familia
 // equivocada rompe en produccion con un 400 que parece un problema de datos —
 // ya paso una vez en el motor del SaaS y estuvo roto una semana sin que nadie lo notara.
-function esFamiliaRazonamiento(model) {
-  return /^(gpt-5|o[1-9])/.test(model);
-}
 
 // Contabilidad de tokens por modelo. Con juez de razonamiento y contexto sin truncar
 // el costo por corrida deja de ser despreciable: conviene saberlo, no estimarlo.
@@ -152,11 +157,6 @@ async function chat(model, messages, maxTokens) {
     throw new Error(`OpenAI (${model}): se agoto el presupuesto de tokens razonando, sin emitir respuesta. Subir max_completion_tokens.`);
   }
   return texto;
-}
-
-function parseJson(text) {
-  try { return JSON.parse(text.replace(/^```(?:json)?\s*|```$/g, '').trim()); }
-  catch (e) { return null; }
 }
 
 // RELEVANCIA DEL CONTEXTO: de los fragmentos recuperados, ¿cuantos ayudan a responder?
@@ -249,37 +249,10 @@ async function medirAcuerdo(question, rows, answer, repeticiones) {
   };
 }
 
-function resumirSerie(valores) {
-  if (valores.length === 0) return null;
-  const media = valores.reduce((a, b) => a + b, 0) / valores.length;
-  const varianza = valores.reduce((a, b) => a + (b - media) ** 2, 0) / valores.length;
-  return {
-    n: valores.length,
-    media,
-    min: Math.min(...valores),
-    max: Math.max(...valores),
-    rango: Math.max(...valores) - Math.min(...valores),
-    desviacion: Math.sqrt(varianza),
-    valores
-  };
-}
-
-function evalOne(rows, expectedEpisodes) {
-  const gotEpisodes = rows.map(r => r.episode_number).filter(e => e != null);
-  const topScore = rows.length ? rows[0].similarity : 0;
-  if (expectedEpisodes.length === 0) {
-    return { hit: null, rank: null, topScore, gotEpisodes };
-  }
-  let rank = null;
-  for (let i = 0; i < gotEpisodes.length; i++) {
-    if (expectedEpisodes.includes(gotEpisodes[i])) { rank = i + 1; break; }
-  }
-  return { hit: rank !== null, rank, topScore, gotEpisodes };
-}
 
 async function main() {
   const results = [];
-  let hits = 0, evaluable = 0, mrrSum = 0;
+  const metricResults = [];
 
   // RAG_LIMIT=3 corre solo las primeras N preguntas: prueba de humo barata antes
   // de gastar saldo real en las 42 con juez.
@@ -302,17 +275,20 @@ async function main() {
   for (const q of preguntas) {
     const embedding = await embed(q.question);
     const rows = await queryKb(embedding, q.question);
-    const evalResult = evalOne(rows, q.expected_episodes || []);
+    const expectedEpisodes = q.expected_episodes || [];
+    const evalResult = evalOne(rows, expectedEpisodes);
     const row = { id: q.id, type: q.type, question: q.question, ...evalResult };
 
     // Recall/MRR solo aplican a preguntas CON ground truth de episodio.
     // Las 'generic' no lo tienen a proposito (a una consulta amplia le sirven muchos
     // episodios distintos); contarlas como MISS deprimiria el recall de forma enganosa.
-    const tieneGroundTruth = (q.expected_episodes || []).length > 0;
-    if (q.type !== 'offtopic' && tieneGroundTruth) {
-      evaluable++;
-      if (evalResult.hit) { hits++; mrrSum += 1 / evalResult.rank; }
-    }
+    const tieneGroundTruth = expectedEpisodes.length > 0;
+    metricResults.push({
+      type: q.type,
+      expectedEpisodes,
+      hit: evalResult.hit,
+      rank: evalResult.rank
+    });
 
     if (JUDGE) {
       const rel = await judgeContextRelevance(q.question, rows);
@@ -349,8 +325,7 @@ async function main() {
     console.log(`[${q.type}] ${q.id} ${status} -- ${q.question}`);
   }
 
-  const recallAtK = evaluable ? (hits / evaluable) : 0;
-  const mrr = evaluable ? (mrrSum / evaluable) : 0;
+  const { hits, evaluable, recallAtK, mrr } = aggregate(metricResults);
   const offtopicScores = results.filter(r => r.type === 'offtopic').map(r => r.topScore);
   const avgOfftopicScore = offtopicScores.length ? offtopicScores.reduce((a, b) => a + b, 0) / offtopicScores.length : null;
 

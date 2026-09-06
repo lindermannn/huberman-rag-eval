@@ -20,7 +20,7 @@ const path = require('path');
 
 const OPENAI_KEY = process.env.OPENAI_API_KEY;
 const SUPABASE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
-const SUPABASE_URL = 'https://YOUR-PROJECT.supabase.co/rest/v1/kb_documents';
+const SUPABASE_PROJECT_URL = (process.env.SUPABASE_URL || '').replace(/\/+$/, '');
 const TENANT_ID = 'tenant_huberman';
 const BATCH_SIZE = 100;
 
@@ -32,6 +32,12 @@ if (!SUPABASE_KEY) {
   console.error('Falta la variable de entorno SUPABASE_SERVICE_ROLE_KEY.');
   process.exit(1);
 }
+if (!SUPABASE_PROJECT_URL) {
+  console.error('Falta la variable de entorno SUPABASE_URL. Define la URL del proyecto Supabase.');
+  process.exit(1);
+}
+
+const SUPABASE_URL = `${SUPABASE_PROJECT_URL}/rest/v1/kb_documents`;
 
 const CHUNKS_FILE = path.join(__dirname, '..', 'data', 'transcript_chunks.json');
 if (!fs.existsSync(CHUNKS_FILE)) {

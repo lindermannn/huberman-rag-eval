@@ -11,6 +11,13 @@ data/database/
 data/transcript_chunks.json
 data/huberman-kb-v1.csv
 data/huberman-kb-additions.csv
+data/clips_aprobados/
+data/candidatos_pendientes.json
+data/memoria_clips.json
+
+# Artefactos de Python
+**/__pycache__/
+*.py[cod]
 Huberman-Lab-Wiki/
 archive.zip
 
